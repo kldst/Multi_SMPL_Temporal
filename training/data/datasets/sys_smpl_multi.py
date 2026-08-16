@@ -66,6 +66,9 @@ class SysSMPLMultiDataset(BaseDataset):
         landmark_visibility_threshold: float = 0.5,
         max_sequences: Optional[int] = None,
         max_frames_per_sequence: Optional[int] = None,
+        compose_cache_root: Optional[str] = None,
+        prefer_compose_cache: bool = False,
+        require_complete_compose_cache: bool = True,
     ):
         super().__init__(common_conf=common_conf)
         # Optional caps to bound the (raw Mamma) build, which cold-reads one pyd
@@ -73,6 +76,13 @@ class SysSMPLMultiDataset(BaseDataset):
         # sequences) for fast debug / quick-iteration startup on a cold disk.
         self.max_sequences = max_sequences
         self.max_frames_per_sequence = max_frames_per_sequence
+        self.compose_cache_root = (
+            Path(compose_cache_root).expanduser()
+            if compose_cache_root is not None
+            else None
+        )
+        self.prefer_compose_cache = bool(prefer_compose_cache)
+        self.require_complete_compose_cache = bool(require_complete_compose_cache)
 
         self.debug = common_conf.debug
         self.training = common_conf.training
@@ -130,6 +140,31 @@ class SysSMPLMultiDataset(BaseDataset):
             from training.data.landmark_mask_gt import load_verts512_matrix
             self._verts512 = load_verts512_matrix(landmark_matrix_path)
 
+        if self.prefer_compose_cache:
+            if self.compose_cache_root is None or not self.compose_cache_root.is_dir():
+                raise ValueError(
+                    "prefer_compose_cache=true requires an existing compose_cache_root; "
+                    f"got {self.compose_cache_root}"
+                )
+            if self.emit_landmarks or self.emit_contact:
+                raise ValueError(
+                    "The compact 518 compose cache does not retain dense vertices/SDF; "
+                    "emit_landmarks and emit_contact must both be false."
+                )
+            if self.emit_dense_geometry:
+                raise ValueError(
+                    "The 518 compose cache fast path requires emit_dense_geometry=false."
+                )
+            if (
+                self.require_complete_compose_cache
+                and not (self.compose_cache_root / "compose_complete.json").is_file()
+            ):
+                raise ValueError(
+                    "Compose cache is partial or unfinished: expected "
+                    f"{self.compose_cache_root / 'compose_complete.json'}. Run the "
+                    "converter without --dataset/--sequence/--max-* before training."
+                )
+
         self.data_store = self._build_sequences()
         people_source = (
             self.frame_data_store.values()
@@ -174,6 +209,11 @@ class SysSMPLMultiDataset(BaseDataset):
         logging.info("%s: SysSMPLMulti total views: %d", status, self.total_frame_num)
         logging.info("SysSMPLMulti max_num_people: %d", self.max_num_people)
         logging.info("SysSMPLMulti data_root: %s", self.data_root)
+        logging.info(
+            "SysSMPLMulti compose cache: enabled=%s, root=%s",
+            self.prefer_compose_cache,
+            self.compose_cache_root,
+        )
         logging.info(
             "SysSMPLMulti temporal training: enabled=%s, clip_length=%d, stride=%d",
             self.use_temporal_training,
@@ -314,12 +354,15 @@ class SysSMPLMultiDataset(BaseDataset):
         return joints[:, :24].detach().cpu().numpy().astype(np.float32)
 
     def _build_sequences(self) -> Dict[str, List[Dict[str, np.ndarray]]]:
-        frame_store, sequence_frames = self._build_raw_mamma_sequences()
+        if self.prefer_compose_cache:
+            frame_store, sequence_frames = self._build_composed_mamma_sequences()
+            source_description = f"518 compose manifests under {self.compose_cache_root}"
+        else:
+            frame_store, sequence_frames = self._build_raw_mamma_sequences()
+            source_description = f"raw Mamma data under {self.data_root} / {self.image_root}"
         if not frame_store:
-            raise ValueError(
-                f"No raw Mamma .data.pyd sequences found under {self.data_root} / {self.image_root}."
-            )
-        logging.info("SysSMPLMulti raw Mamma sequences/frames: %d", len(frame_store))
+            raise ValueError(f"No usable frames found from {source_description}.")
+        logging.info("SysSMPLMulti Mamma indexed frames: %d (%s)", len(frame_store), source_description)
         self.frame_data_store = frame_store
         if not self.use_temporal_training:
             return frame_store
@@ -331,6 +374,117 @@ class SysSMPLMultiDataset(BaseDataset):
             )
         logging.info("SysSMPLMulti temporal clips: %d", len(clip_store))
         return clip_store
+
+    def _build_composed_mamma_sequences(self):
+        """Build an index from compact 518 manifests without reading raw pyd files."""
+        manifest_paths = sorted(self.compose_cache_root.rglob("manifest.pkl"))
+        if self.max_sequences is not None:
+            manifest_paths = manifest_paths[: int(self.max_sequences)]
+
+        data_store: Dict[str, List[Dict[str, np.ndarray]]] = {}
+        sequence_frames = defaultdict(list)
+        expected_shape = tuple(int(x) for x in self.get_target_shape(1.0))
+        skipped = defaultdict(int)
+
+        for manifest_path in manifest_paths:
+            try:
+                manifest = self._load_pickle(manifest_path)
+            except Exception as exc:
+                logging.warning("SysSMPLMulti: unreadable compose manifest %s: %s", manifest_path, exc)
+                skipped["bad_manifest"] += 1
+                continue
+            if (
+                not isinstance(manifest, dict)
+                or manifest.get("format") != "mamma_compose_518"
+                or int(manifest.get("version", -1)) != 1
+            ):
+                skipped["wrong_format"] += 1
+                continue
+            manifest_shape = tuple(int(x) for x in manifest.get("target_shape", ()))
+            if manifest_shape != expected_shape:
+                raise ValueError(
+                    f"Compose cache {manifest_path} has target_shape={manifest_shape}, "
+                    f"but this dataloader requires {expected_shape}."
+                )
+
+            sequence_name = str(
+                manifest.get("sequence_rel")
+                or manifest_path.parent.relative_to(self.compose_cache_root)
+            )
+            frame_items = sorted(
+                manifest.get("frames", {}).items(),
+                key=lambda item: self._numeric_frame_id(item[0]),
+            )
+            if self.max_frames_per_sequence is not None:
+                frame_items = frame_items[: int(self.max_frames_per_sequence)]
+
+            for frame, manifest_annos in frame_items:
+                view_annos = []
+                for cached in manifest_annos:
+                    image_path = manifest_path.parent / cached["image_path"]
+                    mask_rel = cached.get("mask_path")
+                    mask_path = manifest_path.parent / mask_rel if mask_rel else None
+                    camera_path = manifest_path.parent / cached["camera_path"]
+                    if not image_path.is_file() or not camera_path.is_file():
+                        skipped["missing_bundle"] += 1
+                        continue
+                    if mask_path is not None and not mask_path.is_file():
+                        skipped["missing_bundle"] += 1
+                        continue
+                    try:
+                        with np.load(camera_path) as camera:
+                            intrinsics = np.asarray(camera["intrinsics"], dtype=np.float32)
+                            extrinsics = np.asarray(camera["extrinsics"], dtype=np.float32)
+                            original_size = np.asarray(camera["original_size"], dtype=np.int64)
+                            track_offset = np.asarray(camera["track_offset"], dtype=np.float32)
+                    except Exception:
+                        skipped["bad_camera_bundle"] += 1
+                        continue
+                    if (
+                        intrinsics.shape != (3, 3)
+                        or extrinsics.shape != (3, 4)
+                        or track_offset.shape != (2,)
+                    ):
+                        skipped["bad_camera_bundle"] += 1
+                        continue
+
+                    view_annos.append(
+                        {
+                            "view_name": str(cached["view_name"]),
+                            "image_path": str(image_path),
+                            "mask_path": str(mask_path) if mask_path is not None else None,
+                            "data_path": cached.get("source_data_path"),
+                            "intrinsics": intrinsics,
+                            "extrinsics": extrinsics,
+                            "original_size": original_size,
+                            "track_offset": track_offset,
+                            "people": cached["people"],
+                            "num_people": int(cached["num_people"]),
+                            "raw_mamma": True,
+                            "composed_mamma": True,
+                            "preprocessed_518": True,
+                        }
+                    )
+                if len(view_annos) < self.min_num_images:
+                    skipped["too_few_views"] += 1
+                    continue
+                if len({anno["num_people"] for anno in view_annos}) != 1:
+                    skipped["inconsistent_num_people"] += 1
+                    continue
+                frame_key = f"compose_mamma_{sequence_name}_frame_{frame}"
+                data_store[frame_key] = view_annos
+                numeric_frame_id = self._numeric_frame_id(frame)
+                sequence_frames[sequence_name].append(
+                    (numeric_frame_id, str(frame), frame_key)
+                )
+
+        logging.info(
+            "SysSMPLMulti compose summary: manifests=%d frames=%d skipped=%s",
+            len(manifest_paths),
+            len(data_store),
+            dict(skipped),
+        )
+        return data_store, dict(sequence_frames)
 
     @staticmethod
     def _numeric_frame_id(frame_name: str) -> int:
@@ -975,7 +1129,9 @@ class SysSMPLMultiDataset(BaseDataset):
 
             extri_opencv = np.copy(anno["extrinsics"])
             intri_opencv = np.copy(anno["intrinsics"])
-            original_size = np.array(image.shape[:2])
+            original_size = np.asarray(
+                anno.get("original_size", image.shape[:2]), dtype=np.int64
+            ).copy()
 
             people = anno["people"][:person_count]
             joints3d_world = np.zeros((padded_people, 24, 3), dtype=np.float32)
@@ -992,6 +1148,10 @@ class SysSMPLMultiDataset(BaseDataset):
                     extri_opencv,
                     intri_opencv,
                 )
+                if anno.get("preprocessed_518", False):
+                    joints2d_orig[person_idx] += np.asarray(
+                        anno["track_offset"], dtype=np.float32
+                    )
 
             # --- optional dense-landmark GT (raw only): M @ vertices2d in ORIG
             # pixels, appended to the track so it gets the same crop/resize as
@@ -1077,28 +1237,52 @@ class SysSMPLMultiDataset(BaseDataset):
                 track_in = joints2d_orig.reshape(-1, 2)
 
             preprocess_start = time.perf_counter()
-            (
-                image,
-                depth_map,
-                extri_opencv,
-                intri_opencv,
-                world_coords_points,
-                cam_coords_points,
-                point_mask,
-                track_new,
-                confidence,
-            ) = self.process_one_image(
-                image,
-                depth_map,
-                extri_opencv,
-                intri_opencv,
-                original_size,
-                target_image_shape,
-                track=track_in,
-                filepath=image_path,
-                extra_maps=extra_maps,
-                profile_timings=_profile_timings,
-            )
+            if anno.get("preprocessed_518", False):
+                # RGB, mask and K were transformed together by the offline composer.
+                # Repeating process_one_image here would crop/resize a second time and
+                # corrupt both K and 2D GT. Photometric augmentation is applied later
+                # by ComposedDataset, so skipping this geometry does not disable jitter.
+                if tuple(image.shape[:2]) != tuple(int(x) for x in target_image_shape):
+                    raise ValueError(
+                        f"Cached image {image_path} has shape {image.shape[:2]}, but "
+                        f"the requested target is {tuple(target_image_shape)}."
+                    )
+                if self.emit_dense_geometry:
+                    raise ValueError(
+                        "preprocessed_518 fast path requires emit_dense_geometry=false"
+                    )
+                world_coords_points = cam_coords_points = point_mask = None
+                track_new = np.asarray(track_in, dtype=np.float32).copy()
+                x, y = track_new[..., 0], track_new[..., 1]
+                confidence = (
+                    (x >= 0)
+                    & (x < image.shape[1])
+                    & (y >= 0)
+                    & (y < image.shape[0])
+                ).astype(np.float32)
+            else:
+                (
+                    image,
+                    depth_map,
+                    extri_opencv,
+                    intri_opencv,
+                    world_coords_points,
+                    cam_coords_points,
+                    point_mask,
+                    track_new,
+                    confidence,
+                ) = self.process_one_image(
+                    image,
+                    depth_map,
+                    extri_opencv,
+                    intri_opencv,
+                    original_size,
+                    target_image_shape,
+                    track=track_in,
+                    filepath=image_path,
+                    extra_maps=extra_maps,
+                    profile_timings=_profile_timings,
+                )
             preprocess_elapsed += time.perf_counter() - preprocess_start
             H_final, W_final = image.shape[:2]
             joints2d_new = track_new[:n_joint_pts].reshape(padded_people, 24, 2)

@@ -26,6 +26,7 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint
 
 from vggt.heads.dpt_head import DPTHead
 
@@ -117,6 +118,7 @@ class PersonMaskDPTHead(nn.Module):
         intermediate_layer_idx: Optional[List[int]] = None,
         down_ratio: int = 2,
         patch_size: int = 14,
+        frames_chunk_size: int = 8,
     ):
         super().__init__()
         self.embed_dim = int(embed_dim)
@@ -133,6 +135,7 @@ class PersonMaskDPTHead(nn.Module):
             intermediate_layer_idx=intermediate_layer_idx or [4, 11, 17, 23],
             feature_only=True,
             down_ratio=self.down_ratio,
+            frames_chunk_size=int(frames_chunk_size),
         )
         self.pixel_proj = nn.Conv2d(features, self.embed_dim, kernel_size=1)
         self.q_proj = nn.Sequential(
@@ -151,18 +154,59 @@ class PersonMaskDPTHead(nn.Module):
     ) -> torch.Tensor:
         B, P, _ = person_tokens.shape
         S = images.shape[1]
-
-        feat = self.trunk(
-            aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx
-        )                                                        # (B, S, F, H', W')
-        Hm, Wm = feat.shape[-2:]
-        pix = self.pixel_proj(feat.reshape(B * S, *feat.shape[2:]))
-        pix = pix.reshape(B, S, self.embed_dim, Hm, Wm)
-
         q = self.q_proj(person_tokens)                           # (B, P, D)
-        logits = torch.einsum("bpd,bsdhw->bsphw", q, pix.to(q.dtype))
-        logits = logits * (self.embed_dim ** -0.5) * self.log_scale.exp()
-        return logits                                            # (B, S, P, H', W')
+
+        def decode_chunk(q_chunk, tokens, start=None, end=None):
+            if start is None:
+                feat = self.trunk(
+                    tokens, images=images, patch_start_idx=patch_start_idx
+                )
+            else:
+                # Stream high-channel DPT features directly into low-channel
+                # person logits. Calling _forward_impl avoids DPTHead.forward's
+                # full-resolution torch.cat over all view chunks.
+                feat = self.trunk._forward_impl(
+                    tokens,
+                    images,
+                    patch_start_idx,
+                    frames_start_idx=start,
+                    frames_end_idx=end,
+                )
+            chunk_views = feat.shape[1]
+            Hm, Wm = feat.shape[-2:]
+            pix = self.pixel_proj(
+                feat.reshape(B * chunk_views, *feat.shape[2:])
+            )
+            pix = pix.reshape(B, chunk_views, self.embed_dim, Hm, Wm)
+            logits = torch.einsum(
+                "bpd,bsdhw->bsphw", q_chunk, pix.to(q_chunk.dtype)
+            )
+            return logits * (self.embed_dim ** -0.5) * self.log_scale.exp()
+
+        chunk_size = self.trunk.frames_chunk_size
+        if chunk_size is None or int(chunk_size) >= S:
+            return decode_chunk(q, aggregated_tokens_list)
+
+        logits_chunks = []
+        for start in range(0, S, int(chunk_size)):
+            end = min(start + int(chunk_size), S)
+            if self.training and torch.is_grad_enabled():
+                # Return only logits from the checkpoint. Backward recomputes
+                # the much larger DPT feature, rather than retaining one
+                # full-resolution 256-channel tensor per view.
+                def checkpointed(q_input, *token_inputs, _s=start, _e=end):
+                    return decode_chunk(q_input, list(token_inputs), _s, _e)
+
+                logits = checkpoint(
+                    checkpointed,
+                    q,
+                    *aggregated_tokens_list,
+                    use_reentrant=False,
+                )
+            else:
+                logits = decode_chunk(q, aggregated_tokens_list, start, end)
+            logits_chunks.append(logits)
+        return torch.cat(logits_chunks, dim=1)                    # (B, S, P, H', W')
 
 
 __all__ = ["PersonMaskHead", "PersonMaskDPTHead"]

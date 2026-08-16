@@ -18,6 +18,10 @@ from vggt.heads.smpl_head import SMPLHead
 from vggt.heads.smpl_multi_query_head import SMPLMultiQueryHead
 from vggt.heads.smpl_multi_query_trans_head import SMPLMultiQueryTransHead
 from vggt.heads.smpl_multi_query_trans_rot_head import SMPLMultiQueryTransRotHead
+from vggt.heads.smpl_multi_query_trans_rot_temporal_rel_head import (
+    SMPLMultiQueryTemporalRelConfig,
+    SMPLMultiQueryTransRotTemporalRelHead,
+)
 from vggt.heads.smpl_dense_landmark_head import DenseLandmarkHeadConfig, SMPLDenseLandmarkHead
 from vggt.heads.person_mask_head import PersonMaskDPTHead, PersonMaskHead
 from vggt.heads.smpl_direct_mask_head import SMPLDirectMaskCamHead, SMPLDirectMaskHead
@@ -29,6 +33,10 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  enable_camera=True, enable_point=False, enable_depth=False, enable_track=False, enable_smpl=False,
                  enable_smpl_multi_query=False, enable_smpl_multi_query_trans=False,
                  enable_smpl_multi_query_trans_rot=False, smpl_num_people=1,
+                 enable_temporal_path=False, enable_temporal_heads=False,
+                 enable_temporal_rel_pe=False,
+                 temporal_rel_num_buckets=32, temporal_rel_max_distance=31,
+                 temporal_head_max_T=128,
                  enable_smpl_dense_landmark=False, enable_person_mask=False,
                  person_mask_head_type="dot", person_mask_down_ratio=2,
                  person_mask_embed_dim=None,
@@ -37,7 +45,25 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                  ):
         super().__init__()
 
+        if enable_temporal_heads and not enable_smpl_multi_query_trans_rot:
+            raise ValueError(
+                "enable_temporal_heads currently requires "
+                "enable_smpl_multi_query_trans_rot=True"
+            )
+        if enable_temporal_heads and not enable_temporal_path:
+            raise ValueError(
+                "Temporal SMPL heads require enable_temporal_path=True so the "
+                "aggregator remains per-timestep."
+            )
+        if enable_temporal_heads and not enable_temporal_rel_pe:
+            raise ValueError(
+                "Only the relative-PE temporal multi-person head is supported; "
+                "set enable_temporal_rel_pe=True."
+            )
+
         self.aggregator = Aggregator(img_size=img_size, patch_size=patch_size, embed_dim=embed_dim, depth=depth, num_heads=num_heads, patch_embed=patch_embed, patch_embed_checkpoint=patch_embed_checkpoint)
+        self.use_temporal_path_enabled = bool(enable_temporal_path)
+        self.use_temporal_smpl_head = bool(enable_temporal_heads)
         self.camera_head = CameraHead(dim_in=2 * embed_dim) if enable_camera else None
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1", out_channels=out_channels, intermediate_layer_idx=intermediate_layer_idx, frames_chunk_size=frames_chunk_size) if enable_point else None
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1", out_channels=out_channels, intermediate_layer_idx=intermediate_layer_idx, frames_chunk_size=frames_chunk_size) if enable_depth else None
@@ -45,7 +71,27 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         self.smpl_head  = SMPLHead(dim_in=2 * embed_dim) if enable_smpl else None
         self.smpl_multi_query_head = SMPLMultiQueryHead(dim_in=2 * embed_dim, num_people=smpl_num_people) if enable_smpl_multi_query else None
         self.smpl_multi_query_trans_head = SMPLMultiQueryTransHead(dim_in=2 * embed_dim, num_people=smpl_num_people) if enable_smpl_multi_query_trans else None
-        self.smpl_multi_query_trans_rot_head = SMPLMultiQueryTransRotHead(dim_in=2 * embed_dim, num_people=smpl_num_people) if enable_smpl_multi_query_trans_rot else None
+        if enable_smpl_multi_query_trans_rot and enable_temporal_heads:
+            temporal_cfg = SMPLMultiQueryTemporalRelConfig(
+                max_T=int(temporal_head_max_T),
+                rel_num_buckets=int(temporal_rel_num_buckets),
+                rel_max_distance=int(temporal_rel_max_distance),
+            )
+            self.smpl_multi_query_trans_rot_head = (
+                SMPLMultiQueryTransRotTemporalRelHead(
+                    dim_in=2 * embed_dim,
+                    num_people=smpl_num_people,
+                    smpl_cfg=temporal_cfg,
+                )
+            )
+        else:
+            self.smpl_multi_query_trans_rot_head = (
+                SMPLMultiQueryTransRotHead(
+                    dim_in=2 * embed_dim, num_people=smpl_num_people
+                )
+                if enable_smpl_multi_query_trans_rot
+                else None
+            )
         # Auxiliary heads that condition on the SMPL head's person tokens.
         landmark_cfg = DenseLandmarkHeadConfig(
             use_mask_embedding=bool(landmark_use_mask_embedding),
@@ -71,6 +117,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                     intermediate_layer_idx=intermediate_layer_idx,
                     down_ratio=int(person_mask_down_ratio),
                     patch_size=patch_size,
+                    frames_chunk_size=frames_chunk_size,
                 )
             elif self.person_mask_head_type == "dot":
                 self.person_mask_head = PersonMaskHead(
@@ -174,9 +221,35 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         smpl_inputs = smpl_inputs or {}
 
+        # Temporal samples arrive time-major as [B,T*V,3,H,W].  Match the
+        # badminton temporal architecture by folding T into the batch axis before
+        # the aggregator: global attention remains purely multi-view within one
+        # timestep, while the temporal SMPL head performs all cross-time fusion.
+        images_for_heads = images
+        if self.use_temporal_path_enabled:
+            temporal_num_frames = smpl_inputs.get("temporal_num_frames")
+            views_per_frame = smpl_inputs.get("views_per_frame")
+            if temporal_num_frames is not None and views_per_frame is not None:
+                temporal_values = temporal_num_frames.reshape(-1)
+                view_values = views_per_frame.reshape(-1)
+                if not torch.all(temporal_values == temporal_values[0]):
+                    raise ValueError("All clips in one batch must have the same T")
+                if not torch.all(view_values == view_values[0]):
+                    raise ValueError("All clips in one batch must have the same V")
+                T = int(temporal_values[0].item())
+                V = int(view_values[0].item())
+                B, S = images.shape[:2]
+                if S != T * V:
+                    raise ValueError(
+                        f"Temporal images have S={S}, expected T*V={T*V}"
+                    )
+                images_for_heads = images.reshape(
+                    B, T, V, *images.shape[2:]
+                ).reshape(B * T, V, *images.shape[2:])
+
         needs_encoder_patch_tokens = return_encoder_feature_map
         aggregated_tokens_list, patch_start_idx, encoder_patch_tokens = self.aggregator(
-            images, return_patch_tokens=needs_encoder_patch_tokens
+            images_for_heads, return_patch_tokens=needs_encoder_patch_tokens
         )
 
         aggregator_feature_map = None
@@ -184,16 +257,16 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
         if return_aggregator_feature_map:
             final_tokens = aggregated_tokens_list[-1]
             patch_tokens = final_tokens[:, :, patch_start_idx:, :]
-            patch_h = images.shape[-2] // self.aggregator.patch_size
-            patch_w = images.shape[-1] // self.aggregator.patch_size
+            patch_h = images_for_heads.shape[-2] // self.aggregator.patch_size
+            patch_w = images_for_heads.shape[-1] // self.aggregator.patch_size
             if patch_h * patch_w != patch_tokens.shape[2]:
                 raise ValueError(
                     "Mismatch between aggregator patch grid and token count: expected "
                     f"{patch_h * patch_w}, got {patch_tokens.shape[2]}. Check patch_size and image resolution."
                 )
             aggregator_feature_map = patch_tokens.reshape(
-                images.shape[0],
-                images.shape[1],
+                images_for_heads.shape[0],
+                images_for_heads.shape[1],
                 patch_h,
                 patch_w,
                 patch_tokens.shape[-1],
@@ -223,7 +296,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             if self.depth_head is not None:
                 depth_out = self.depth_head(
                     aggregated_tokens_list,
-                    images=images,
+                    images=images_for_heads,
                     patch_start_idx=patch_start_idx,
                     return_feature_map=return_depth_feature_map,
                 )
@@ -238,7 +311,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
             if self.point_head is not None:
                 point_out = self.point_head(
                     aggregated_tokens_list,
-                    images=images,
+                    images=images_for_heads,
                     patch_start_idx=patch_start_idx,
                     return_feature_map=return_point_feature_map,
                 )
@@ -272,9 +345,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 predictions.update(smpl_outputs)
 
             if self.smpl_multi_query_trans_rot_head is not None:
+                head_kwargs = {}
+                if self.use_temporal_smpl_head:
+                    head_kwargs["smpl_inputs"] = smpl_inputs
                 smpl_outputs = self.smpl_multi_query_trans_rot_head(
                     aggregated_tokens_list,
                     patch_start_idx=patch_start_idx,
+                    **head_kwargs,
                 )
                 predictions.update(smpl_outputs)
 
@@ -288,8 +365,8 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                 # (B, S, N_patch, 2C) per-view patch tokens from the last block.
                 patch_tokens = aggregated_tokens_list[-1][:, :, patch_start_idx:, :]
                 B, S, N_patch, C = patch_tokens.shape
-                patch_h = images.shape[-2] // self.aggregator.patch_size
-                patch_w = images.shape[-1] // self.aggregator.patch_size
+                patch_h = images_for_heads.shape[-2] // self.aggregator.patch_size
+                patch_w = images_for_heads.shape[-1] // self.aggregator.patch_size
 
                 if self.person_mask_head is not None:
                     if self.person_mask_head_type == "dpt":
@@ -297,13 +374,13 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
                         predictions["person_mask_logits"] = self.person_mask_head(
                             person_tokens,
                             aggregated_tokens_list,
-                            images=images,
+                            images=images_for_heads,
                             patch_start_idx=patch_start_idx,
                         )
                     elif self.person_mask_head_type == "direct":
                         # full-res (B, S, P, H, W) decoded straight from the token.
                         predictions["person_mask_logits"] = self.person_mask_head(
-                            person_tokens, images=images
+                            person_tokens, images=images_for_heads
                         )
                     elif self.person_mask_head_type == "direct_cam":
                         # token + per-view camera token (idx 0 of the last block,
@@ -331,7 +408,7 @@ class VGGT(nn.Module, PyTorchModelHubMixin):
 
         if self.track_head is not None and query_points is not None:
             track_list, vis, conf = self.track_head(
-                aggregated_tokens_list, images=images, patch_start_idx=patch_start_idx, query_points=query_points
+                aggregated_tokens_list, images=images_for_heads, patch_start_idx=patch_start_idx, query_points=query_points
             )
             predictions["track"] = track_list[-1]  # track of the last iteration
             predictions["vis"] = vis

@@ -103,3 +103,7 @@ Thumbs.db
 /MAMMA_markerless_multiple_people
 /debug/*
 !/debug/debug_mixed_mamma_harmony4d.py
+!/debug/debug_compose_mamma_518.py
+!/debug/temporal_alignment/
+!/debug/temporal_alignment/**
+/debug/temporal_alignment/outputs/

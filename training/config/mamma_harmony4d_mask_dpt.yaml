@@ -19,6 +19,9 @@ data:
       rescale: true
       rescale_aug: false
       landscape_check: false
+      # Depth/point heads and losses are disabled in this experiment, so do not
+      # allocate zero depth maps or derive dense camera/world point tensors.
+      emit_dense_geometry: false
       debug: false
       get_nearby: false
       img_nums:
@@ -62,6 +65,9 @@ data:
         person_mask_stride: 1
         max_sequences: ${debug_max_sequences}
         max_frames_per_sequence: ${debug_max_frames_per_sequence}
+        compose_cache_root: ${mamma_compose_cache_root}
+        prefer_compose_cache: ${use_mamma_compose_cache}
+        require_complete_compose_cache: true
       - _target_: training.data.datasets.harmony4d.Harmony4DDataset
         split: train
         Harmony4D_DIR: /dataset/Harmony4D
@@ -95,6 +101,7 @@ data:
       rescale: true
       rescale_aug: false
       landscape_check: false
+      emit_dense_geometry: false
       debug: false
       get_nearby: false
       img_nums:
@@ -134,13 +141,17 @@ data:
         fixed_anchor_camera: null
         max_sequences: ${debug_val_max_sequences}
         max_frames_per_sequence: ${debug_val_max_frames_per_sequence}
-exp_name: mamma_harmony4d_concat_mask_dpt
+exp_name: mamma_harmony4d_concat_mask_dpt_temporal_rel
+# Keep false while mamma_compose is only partially generated. Switch to true
+# after the unrestricted compose_script/compose_mamma_518.py run completes.
+use_mamma_compose_cache: false
+mamma_compose_cache_root: /train-data-3-hdd/yian/Multi_SMPL_0706/mamma/mamma_compose
 debug_max_sequences: null
 debug_max_frames_per_sequence: null
 debug_val_max_sequences: null
 debug_val_max_frames_per_sequence: null
 temporal_training:
-  enabled: false
+  enabled: true
   clip_length: 3
   clip_stride: 1
   loss_type: l1
@@ -334,6 +345,23 @@ optim:
         interval_scaling:
         - rescaled
         - rescaled
+    - scheduler:
+        _target_: fvcore.common.param_scheduler.CompositeParamScheduler
+        schedulers:
+        - _target_: fvcore.common.param_scheduler.LinearParamScheduler
+          start_value: 1.0e-08
+          end_value: 1.0e-04
+        - _target_: fvcore.common.param_scheduler.CosineParamScheduler
+          start_value: 1.0e-04
+          end_value: 1.0e-08
+        lengths:
+        - 0.01
+        - 0.99
+        interval_scaling:
+        - rescaled
+        - rescaled
+      param_names:
+      - '*smpl_multi_query_trans_rot_head*rel_bias*'
     weight_decay:
     - scheduler:
         _target_: fvcore.common.param_scheduler.ConstantParamScheduler
@@ -341,6 +369,10 @@ optim:
 max_epochs: 100
 model:
   _target_: vggt.models.vggt.VGGT
+  # The temporal path folds T into the batch axis. Chunk the full-resolution
+  # DPT mask trunk one view at a time to keep T=3,V=8 within 24GB; this changes
+  # only execution peak memory, not parameters or numerical architecture.
+  frames_chunk_size: 1
   enable_camera: true
   enable_depth: false
   enable_point: false
@@ -350,6 +382,16 @@ model:
   enable_smpl_multi_query_trans: false
   enable_smpl_multi_query_trans_rot: true
   smpl_num_people: 20
+  # Match 0726_conf's temporal architecture: run the VGGT aggregator once per
+  # timestep (multi-view only), then jointly decode the complete SMPL sequence.
+  enable_temporal_path: true
+  enable_temporal_heads: true
+  enable_temporal_rel_pe: true
+  # Keep the same relative-bias layout and future T<=90 continuation contract as
+  # 0726_conf. Current MAMMA/Harmony4D clips use T=3.
+  temporal_rel_num_buckets: 64
+  temporal_rel_max_distance: 89
+  temporal_head_max_T: 90
   enable_smpl_dense_landmark: false
   enable_person_mask: true
   person_mask_head_type: dpt

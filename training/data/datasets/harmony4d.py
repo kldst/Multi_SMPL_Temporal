@@ -28,6 +28,7 @@ from __future__ import annotations
 import logging
 import pickle
 import random
+import re
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,6 +107,19 @@ class Harmony4DDataset(BaseDataset):
         self.fixed_view_sampling = bool(
             getattr(common_conf, "fixed_view_sampling", False)
         )
+        self.use_temporal_training = bool(
+            getattr(common_conf, "use_temporal_training", False)
+        )
+        self.temporal_clip_length = int(
+            getattr(common_conf, "temporal_clip_length", 3)
+        )
+        self.temporal_clip_stride = int(
+            getattr(common_conf, "temporal_clip_stride", 1)
+        )
+        if self.temporal_clip_length < 2:
+            raise ValueError("temporal_clip_length must be >= 2")
+        if self.temporal_clip_stride < 1:
+            raise ValueError("temporal_clip_stride must be >= 1")
         self.min_num_images = int(min_num_images)
         self.max_num_people = int(max_num_people)
         if self.max_num_people < len(self.PEOPLE):
@@ -215,10 +229,23 @@ class Harmony4DDataset(BaseDataset):
             self.sequences.append(record)
             self.samples.extend((seq_idx, frame) for frame in record.frames)
 
-        self.len_train = len(self.samples)
         if not self.samples:
             raise ValueError(
                 f"No usable Harmony4D samples under {self.root} for split={self.split}"
+            )
+
+        self.temporal_samples = (
+            self._build_temporal_samples() if self.use_temporal_training else []
+        )
+        self.len_train = (
+            len(self.temporal_samples)
+            if self.use_temporal_training
+            else len(self.samples)
+        )
+        if self.use_temporal_training and not self.temporal_samples:
+            raise ValueError(
+                "Harmony4D temporal training produced no consecutive clips; "
+                f"T={self.temporal_clip_length}, stride={self.temporal_clip_stride}"
             )
 
         logging.info(
@@ -229,6 +256,14 @@ class Harmony4DDataset(BaseDataset):
             self.min_num_images,
             self.root,
         )
+        if self.use_temporal_training:
+            logging.info(
+                "Harmony4D %s temporal clips: %d (T=%d, stride=%d)",
+                self.split,
+                len(self.temporal_samples),
+                self.temporal_clip_length,
+                self.temporal_clip_stride,
+            )
         logging.info(
             "Harmony4D %s filtering: candidates=%d, missing_annotations=%d, "
             "incomplete_mask_frames=%d, retained=%d",
@@ -238,6 +273,41 @@ class Harmony4DDataset(BaseDataset):
             incomplete_mask_frames,
             len(self.samples),
         )
+
+    @staticmethod
+    def _numeric_frame_id(frame: str) -> int:
+        matches = re.findall(r"\d+", str(frame))
+        if not matches:
+            raise ValueError(f"Frame name has no numeric id: {frame!r}")
+        return int(matches[-1])
+
+    def _build_temporal_samples(self):
+        clips = []
+        T = self.temporal_clip_length
+        stride = self.temporal_clip_stride
+        for sequence_index, record in enumerate(self.sequences):
+            ordered = sorted(
+                record.frames, key=lambda frame: self._numeric_frame_id(frame)
+            )
+            runs = []
+            for frame in ordered:
+                frame_id = self._numeric_frame_id(frame)
+                if not runs or frame_id - runs[-1][-1][0] != 1:
+                    runs.append([])
+                runs[-1].append((frame_id, frame))
+            for run in runs:
+                if len(run) < T:
+                    continue
+                for start in range(0, len(run) - T + 1, stride):
+                    window = run[start : start + T]
+                    clips.append(
+                        (
+                            sequence_index,
+                            tuple(frame for _, frame in window),
+                            tuple(frame_id for frame_id, _ in window),
+                        )
+                    )
+        return clips
 
     @staticmethod
     def _discover_sequences(root: Path) -> List[Path]:
@@ -614,7 +684,149 @@ class Harmony4DDataset(BaseDataset):
                 order = [anchor] + [i for i in order if i != anchor]
         return order[:img_per_seq]
 
+    def get_temporal_length(self, index: int) -> int:
+        return self.temporal_clip_length if self.use_temporal_training else 1
+
     def get_data(
+        self,
+        seq_index=None,
+        seq_name=None,
+        ids=None,
+        img_per_seq=None,
+        aspect_ratio=1.0,
+        _resample_depth: int = 0,
+    ):
+        if not self.use_temporal_training:
+            return self._get_single_frame_data(
+                seq_index=seq_index,
+                seq_name=seq_name,
+                ids=ids,
+                img_per_seq=img_per_seq,
+                aspect_ratio=aspect_ratio,
+                _resample_depth=_resample_depth,
+            )
+        if seq_name is not None:
+            raise ValueError("seq_name lookup is not supported for temporal Harmony4D clips")
+
+        clip_index = int(seq_index)
+        record_index, frames, frame_ids = self.temporal_samples[clip_index]
+        record = self.sequences[record_index]
+        requested = int(img_per_seq or len(record.cameras))
+        common_views = [
+            camera_index
+            for camera_index, camera in enumerate(record.cameras)
+            if all(self._view_available(record, camera, frame) for frame in frames)
+        ]
+        if len(common_views) < requested:
+            if _resample_depth < 20 and len(self.temporal_samples) > 1:
+                return self.get_data(
+                    seq_index=random.randrange(len(self.temporal_samples)),
+                    img_per_seq=requested,
+                    aspect_ratio=aspect_ratio,
+                    _resample_depth=_resample_depth + 1,
+                )
+            raise RuntimeError(
+                f"{record.name}/{frames[0]}..{frames[-1]} has "
+                f"{len(common_views)} shared views, needs {requested}"
+            )
+
+        if ids is not None:
+            requested_order = [int(i) for i in ids if int(i) in common_views]
+            view_ids = requested_order + [
+                i for i in common_views if i not in set(requested_order)
+            ]
+        elif self.fixed_view_sampling:
+            view_ids = list(common_views)
+        else:
+            view_ids = list(np.random.permutation(common_views))
+        if self.fixed_anchor_camera:
+            anchor = next(
+                (
+                    i
+                    for i in common_views
+                    if record.cameras[i].name == self.fixed_anchor_camera
+                ),
+                None,
+            )
+            if anchor is not None:
+                view_ids = [anchor] + [i for i in view_ids if i != anchor]
+        view_ids = view_ids[:requested]
+
+        frame_batches = [
+            self._get_single_frame_data(
+                seq_name=f"{record.name}/{frame}",
+                ids=view_ids,
+                img_per_seq=requested,
+                aspect_ratio=aspect_ratio,
+                # A temporal clip must never silently substitute an unrelated
+                # frame when one selected view fails to load.
+                _resample_depth=20,
+            )
+            for frame in frames
+        ]
+        return self._combine_temporal_frame_batches(
+            record=record,
+            frames=frames,
+            frame_ids=frame_ids,
+            view_ids=view_ids,
+            frame_batches=frame_batches,
+        )
+
+    def _combine_temporal_frame_batches(
+        self, *, record, frames, frame_ids, view_ids, frame_batches
+    ):
+        T = len(frame_batches)
+        V = len(view_ids)
+        combined = {
+            "seq_name": (
+                f"harmony4d_temporal_{record.name.replace('/', '_')}_"
+                f"{frames[0]}_{frames[-1]}"
+            ),
+            "frame_num": T * V,
+            "temporal_num_frames": T,
+            "views_per_frame": V,
+            "frame_ids": np.asarray(frame_ids, dtype=np.int64),
+            "view_ids": np.asarray(view_ids, dtype=np.int64),
+            "ids": np.tile(np.asarray(view_ids, dtype=np.int64), T),
+            "person_keys": list(frame_batches[0]["person_keys"]),
+            "num_people": np.asarray(
+                [int(np.asarray(batch["num_people"]).item()) for batch in frame_batches],
+                dtype=np.int64,
+            ),
+            "smpl_model_type": self.body_model_type,
+        }
+
+        view_list_keys = (
+            "images", "depths", "extrinsics", "intrinsics", "cam_points",
+            "world_points", "point_masks", "original_sizes", "image_filenames",
+        )
+        for key in view_list_keys:
+            if all(key in batch for batch in frame_batches):
+                combined[key] = [
+                    value for batch in frame_batches for value in batch[key]
+                ]
+
+        view_array_keys = (
+            "smpl_joints2d", "smpl_joints3d_world",
+            "smpl_joints2d_confidence", "person_mask", "cam_ids",
+        )
+        for key in view_array_keys:
+            if all(key in batch for batch in frame_batches):
+                combined[key] = np.concatenate(
+                    [np.asarray(batch[key]) for batch in frame_batches], axis=0
+                )
+
+        person_keys = (
+            "smpl_pose", "smpl_beta", "smpl_trans", "smpl_gender", "has_smpl",
+        )
+        for key in person_keys:
+            if all(key in batch for batch in frame_batches):
+                combined[key] = np.stack(
+                    [np.asarray(batch[key]) for batch in frame_batches], axis=0
+                )
+        return combined
+
+    def _get_single_frame_data(
         self,
         seq_index=None,
         seq_name=None,
@@ -641,7 +853,7 @@ class Harmony4DDataset(BaseDataset):
             view_ids = self._view_order(record, frame, n_views, ids)
         except RuntimeError:
             if _resample_depth < 20 and len(self.samples) > 1:
-                return self.get_data(
+                return self._get_single_frame_data(
                     seq_index=random.randrange(len(self.samples)),
                     img_per_seq=n_views,
                     aspect_ratio=aspect_ratio,
@@ -720,7 +932,7 @@ class Harmony4DDataset(BaseDataset):
             image = read_image_cv2(str(image_path))
             if image is None:
                 if _resample_depth < 20 and len(self.samples) > 1:
-                    return self.get_data(
+                    return self._get_single_frame_data(
                         seq_index=random.randrange(len(self.samples)),
                         img_per_seq=n_views,
                         aspect_ratio=aspect_ratio,

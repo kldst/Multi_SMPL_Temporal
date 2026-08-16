@@ -992,18 +992,34 @@ class Trainer:
         Returns:
             A dictionary containing the computed losses.
         """
-        batch = flatten_temporal_batch_for_framewise_model(batch)
+        model_module = model.module if hasattr(model, "module") else model
+        use_temporal_model = bool(
+            getattr(model_module, "use_temporal_smpl_head", False)
+        )
+        # Preserve the legacy framewise-temporal configs: only the new temporal
+        # head needs the clip axis during forward.
+        if not use_temporal_model:
+            batch = flatten_temporal_batch_for_framewise_model(batch)
+
         if batch["images"].dtype == torch.uint8:
             batch["images"] = batch["images"].to(
                 dtype=torch.get_default_dtype()
             ).div_(255)
         smpl_inputs = {}
-        for key in ("views_per_frame", "temporal_num_frames", "frame_ids", "view_ids"):
+        for key in (
+            "views_per_frame", "temporal_num_frames", "num_groups",
+            "frame_ids", "view_ids",
+        ):
             if key in batch:
                 smpl_inputs[key] = batch[key]
 
-        # Forward pass
+        # Keep [B,T*V,...] intact for the model.  VGGT folds it to [B*T,V,...]
+        # only around the per-timestep aggregator, then the temporal SMPL head
+        # jointly decodes all T frames.  Flatten the GT AFTER forward so the
+        # existing framewise SMPL/camera/mask losses retain their [B*T,...] API.
         y_hat = model(images=batch["images"], smpl_inputs=smpl_inputs)
+        if use_temporal_model:
+            batch = flatten_temporal_batch_for_framewise_model(batch)
 
         # first_nonfinite(y_hat, "y_hat")
         
