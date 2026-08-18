@@ -180,7 +180,7 @@ scale_by_extrinsics: false
 patch_size: 14
 val_epoch_freq: 5
 enable_val: true
-max_img_per_gpu: 40
+max_img_per_gpu: 120
 limit_train_batches: null
 limit_val_batches: 10
 logging:
