@@ -69,6 +69,8 @@ class SysSMPLMultiDataset(BaseDataset):
         compose_cache_root: Optional[str] = None,
         prefer_compose_cache: bool = False,
         require_complete_compose_cache: bool = True,
+        val_sequence_fraction: float = 0.0,
+        split_seed: int = 42,
     ):
         super().__init__(common_conf=common_conf)
         # Optional caps to bound the (raw Mamma) build, which cold-reads one pyd
@@ -83,6 +85,13 @@ class SysSMPLMultiDataset(BaseDataset):
         )
         self.prefer_compose_cache = bool(prefer_compose_cache)
         self.require_complete_compose_cache = bool(require_complete_compose_cache)
+        self.split = str(split).lower()
+        if self.split not in {"train", "val", "test"}:
+            raise ValueError(f"Invalid split: {split}")
+        self.val_sequence_fraction = float(val_sequence_fraction)
+        if not 0.0 <= self.val_sequence_fraction < 1.0:
+            raise ValueError("val_sequence_fraction must be in [0, 1)")
+        self.split_seed = int(split_seed)
 
         self.debug = common_conf.debug
         self.training = common_conf.training
@@ -197,12 +206,10 @@ class SysSMPLMultiDataset(BaseDataset):
         else:
             self.total_frame_num = sum(len(seq) for seq in self.data_store.values())
 
-        if split == "train":
+        if self.split in {"train", "val"}:
             self.len_train = self.sequence_list_len if len_train is None else min(len_train, self.sequence_list_len)
-        elif split == "test":
+        elif self.split == "test":
             self.len_train = self.sequence_list_len
-        else:
-            raise ValueError(f"Invalid split: {split}")
 
         status = "Training" if self.training else "Testing"
         logging.info("%s: SysSMPLMulti sequences: %d", status, self.sequence_list_len)
@@ -378,6 +385,7 @@ class SysSMPLMultiDataset(BaseDataset):
     def _build_composed_mamma_sequences(self):
         """Build an index from compact 518 manifests without reading raw pyd files."""
         manifest_paths = sorted(self.compose_cache_root.rglob("manifest.pkl"))
+        manifest_paths = self._split_compose_manifests(manifest_paths)
         if self.max_sequences is not None:
             manifest_paths = manifest_paths[: int(self.max_sequences)]
 
@@ -431,19 +439,42 @@ class SysSMPLMultiDataset(BaseDataset):
                     if mask_path is not None and not mask_path.is_file():
                         skipped["missing_bundle"] += 1
                         continue
+                    # Version-1 manifests duplicate the small camera arrays so
+                    # startup does not need to decompress one NPZ per view. Keep
+                    # the NPZ existence check above because it is still part of
+                    # a complete on-disk bundle, and fall back to it for caches
+                    # written by an early converter revision.
                     try:
-                        with np.load(camera_path) as camera:
-                            intrinsics = np.asarray(camera["intrinsics"], dtype=np.float32)
-                            extrinsics = np.asarray(camera["extrinsics"], dtype=np.float32)
-                            original_size = np.asarray(camera["original_size"], dtype=np.int64)
-                            track_offset = np.asarray(camera["track_offset"], dtype=np.float32)
-                    except Exception:
-                        skipped["bad_camera_bundle"] += 1
-                        continue
+                        camera_values = (
+                            cached["intrinsics"],
+                            cached["extrinsics"],
+                            cached["original_size"],
+                            cached["track_offset"],
+                        )
+                    except KeyError:
+                        try:
+                            with np.load(camera_path) as camera:
+                                camera_values = (
+                                    camera["intrinsics"],
+                                    camera["extrinsics"],
+                                    camera["original_size"],
+                                    camera["track_offset"],
+                                )
+                        except Exception:
+                            skipped["bad_camera_bundle"] += 1
+                            continue
+                    intrinsics = np.asarray(camera_values[0], dtype=np.float32)
+                    extrinsics = np.asarray(camera_values[1], dtype=np.float32)
+                    original_size = np.asarray(camera_values[2], dtype=np.int64)
+                    track_offset = np.asarray(camera_values[3], dtype=np.float32)
                     if (
                         intrinsics.shape != (3, 3)
                         or extrinsics.shape != (3, 4)
+                        or original_size.shape != (2,)
                         or track_offset.shape != (2,)
+                        or not np.isfinite(intrinsics).all()
+                        or not np.isfinite(extrinsics).all()
+                        or not np.isfinite(track_offset).all()
                     ):
                         skipped["bad_camera_bundle"] += 1
                         continue
@@ -485,6 +516,20 @@ class SysSMPLMultiDataset(BaseDataset):
             dict(skipped),
         )
         return data_store, dict(sequence_frames)
+
+    def _split_compose_manifests(self, paths: List[Path]) -> List[Path]:
+        """Deterministically split compose caches at physical-sequence level."""
+        if self.split == "test":
+            return paths
+        if self.val_sequence_fraction <= 0.0 or len(paths) <= 1:
+            return paths if self.split == "train" else []
+        rng = np.random.default_rng(self.split_seed)
+        order = rng.permutation(len(paths))
+        n_val = max(1, int(round(len(paths) * self.val_sequence_fraction)))
+        val_ids = set(int(index) for index in order[:n_val])
+        if self.split == "train":
+            return [path for index, path in enumerate(paths) if index not in val_ids]
+        return [path for index, path in enumerate(paths) if index in val_ids]
 
     @staticmethod
     def _numeric_frame_id(frame_name: str) -> int:

@@ -55,8 +55,10 @@ data:
       dataset_configs:
       - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
         split: train
-        SysSMPL_DIR: /dataset/mamma
-        SysSMPL_ANNOTATION_DIR: /dataset/mamma
+        # The compact cache is the only data source used on this path. These two
+        # roots remain required by the common MAMMA loader API.
+        SysSMPL_DIR: ${mamma_compose_root}
+        SysSMPL_ANNOTATION_DIR: ${mamma_compose_root}
         max_num_people: 6
         min_num_images: 8
         emit_landmarks: false
@@ -65,22 +67,30 @@ data:
         person_mask_stride: 1
         max_sequences: ${debug_max_sequences}
         max_frames_per_sequence: ${debug_max_frames_per_sequence}
-        compose_cache_root: ${mamma_compose_cache_root}
-        prefer_compose_cache: ${use_mamma_compose_cache}
-        require_complete_compose_cache: true
-      - _target_: training.data.datasets.harmony4d.Harmony4DDataset
+        compose_cache_root: ${mamma_compose_root}
+        prefer_compose_cache: true
+        # The converter reports ten corrupt raw views and correctly withheld
+        # compose_complete.json. Independently, 1,135 manifest frames have fewer
+        # than eight views; min_num_images filters all of them, leaving 49,562
+        # usable frames rather than weakening the eight-view training contract.
+        require_complete_compose_cache: false
+        val_sequence_fraction: 0.0
+        split_seed: ${split_seed}
+      - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
         split: train
-        Harmony4D_DIR: /dataset/Harmony4D
-        min_num_images: 8
+        SysSMPL_DIR: ${harmony4d_compose_root}
+        SysSMPL_ANNOTATION_DIR: ${harmony4d_compose_root}
         max_num_people: 6
-        body_model_type: smplx
-        smplx_annotation_root: /Multi_SMPL_0706/smpl_transfer/output
-        person_mask_root: /Multi_SMPL_0706/smpl_transfer/masks
+        min_num_images: 8
+        emit_landmarks: false
+        emit_contact: false
         emit_person_mask: true
         person_mask_stride: 1
+        compose_cache_root: ${harmony4d_compose_root}
+        prefer_compose_cache: true
+        require_complete_compose_cache: true
         val_sequence_fraction: ${val_sequence_fraction}
         split_seed: ${split_seed}
-        fixed_anchor_camera: null
         max_sequences: ${debug_max_sequences}
         max_frames_per_sequence: ${debug_max_frames_per_sequence}
   val:
@@ -126,26 +136,26 @@ data:
     dataset:
       _target_: data.composed_dataset.ComposedDataset
       dataset_configs:
-      - _target_: training.data.datasets.harmony4d.Harmony4DDataset
+      - _target_: training.data.datasets.sys_smpl_multi.SysSMPLMultiDataset
         split: val
-        Harmony4D_DIR: /dataset/Harmony4D
-        min_num_images: 8
+        SysSMPL_DIR: ${harmony4d_compose_root}
+        SysSMPL_ANNOTATION_DIR: ${harmony4d_compose_root}
         max_num_people: 6
-        body_model_type: smplx
-        smplx_annotation_root: /Multi_SMPL_0706/smpl_transfer/output
-        person_mask_root: /Multi_SMPL_0706/smpl_transfer/masks
+        min_num_images: 8
+        emit_landmarks: false
+        emit_contact: false
         emit_person_mask: true
         person_mask_stride: 1
+        compose_cache_root: ${harmony4d_compose_root}
+        prefer_compose_cache: true
+        require_complete_compose_cache: true
         val_sequence_fraction: ${val_sequence_fraction}
         split_seed: ${split_seed}
-        fixed_anchor_camera: null
         max_sequences: ${debug_val_max_sequences}
         max_frames_per_sequence: ${debug_val_max_frames_per_sequence}
 exp_name: mamma_harmony4d_concat_mask_dpt_temporal_rel
-# Keep false while mamma_compose is only partially generated. Switch to true
-# after the unrestricted compose_script/compose_mamma_518.py run completes.
-use_mamma_compose_cache: false
-mamma_compose_cache_root: /train-data-3-hdd/yian/Multi_SMPL_0706/mamma/mamma_compose
+mamma_compose_root: /dataset/mamma_compose
+harmony4d_compose_root: /dataset/mamma_harmony4d_compose
 debug_max_sequences: null
 debug_max_frames_per_sequence: null
 debug_val_max_sequences: null
@@ -153,7 +163,7 @@ debug_val_max_frames_per_sequence: null
 temporal_training:
   enabled: true
   clip_length: 3
-  clip_stride: 1
+  clip_stride: 3
   loss_type: l1
   pose_order: 2
   beta_order: 1

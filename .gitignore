@@ -104,6 +104,7 @@ Thumbs.db
 /debug/*
 !/debug/debug_mixed_mamma_harmony4d.py
 !/debug/debug_compose_mamma_518.py
+!/debug/validate_training_compose_datasets.py
 !/debug/temporal_alignment/
 !/debug/temporal_alignment/**
 /debug/temporal_alignment/outputs/
