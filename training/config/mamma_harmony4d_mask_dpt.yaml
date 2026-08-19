@@ -264,6 +264,7 @@ checkpoint:
   load_aggregator_only: false
   load_model_only: true
   init_mask_trunk_from_depth: /Multi_SMPL_Temporal/logs/mamma_harmony4d_concat_mask_dpt_temporal_rel/ckpts/checkpoint_5.pt
+loss:
   _target_: loss.MultitaskLoss
   smplx_model_dir: /dataset/smplx_models
   camera:
