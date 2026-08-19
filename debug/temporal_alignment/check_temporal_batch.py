@@ -566,6 +566,11 @@ def configure_one_batch(cfg, args):
         if args.source == "mamma":
             selected.SysSMPL_DIR = str(args.mamma_sequence)
             selected.SysSMPL_ANNOTATION_DIR = str(args.mamma_sequence)
+            # The one-batch probe points directly at a raw sequence rather than
+            # the training compose cache, so do not retain the config's cache-only
+            # loading mode (or its machine-specific compose_cache_root).
+            selected.prefer_compose_cache = False
+            selected.require_complete_compose_cache = False
         else:
             selected.split = "train"
             selected.Harmony4D_DIR = str(args.harmony_root)
@@ -685,6 +690,7 @@ def main() -> int:
         "loss_smpl_temporal_pose",
         "loss_smpl_temporal_beta",
         "loss_smpl_temporal_mesh_translate",
+        "loss_smpl_temporal_root_rotation",
     }
     core_keys = (
         "loss_camera",

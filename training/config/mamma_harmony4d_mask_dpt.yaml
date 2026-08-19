@@ -153,7 +153,7 @@ data:
         split_seed: ${split_seed}
         max_sequences: ${debug_val_max_sequences}
         max_frames_per_sequence: ${debug_val_max_frames_per_sequence}
-exp_name: mamma_harmony4d_concat_mask_dpt_temporal_rel
+exp_name: mamma_harmony4d_concat_mask_dpt_temporal_rel_root
 mamma_compose_root: /dataset/mamma_compose
 harmony4d_compose_root: /dataset/mamma_harmony4d_compose
 debug_max_sequences: null
@@ -163,15 +163,21 @@ debug_val_max_frames_per_sequence: null
 temporal_training:
   enabled: true
   clip_length: 3
+  # Overlap clips so every adjacent-frame boundary receives temporal supervision.
   clip_stride: 3
   loss_type: l1
   pose_order: 2
   beta_order: 1
   mesh_translate_order: 2
+  # Keep the existing local-pose smoother root-free. Root motion is supervised
+  # separately below on relative SO(3) rotations, so genuine turns are preserved.
   exclude_root: true
+  root_rotation_order: 1
+  root_rotation_loss_type: l1
   weight_pose: 0.05
   weight_beta: 0.01
   weight_mesh_translate: 0.05
+  weight_root_rotation: 0.02
 img_size: 518
 num_workers: 0
 seed_value: 42
@@ -220,6 +226,7 @@ logging:
       - loss_smpl_temporal_pose
       - loss_smpl_temporal_beta
       - loss_smpl_temporal_mesh_translate
+      - loss_smpl_temporal_root_rotation
       - loss_mask
       - mask_soft_iou
       - hungarian_mask_cost
@@ -242,6 +249,7 @@ logging:
       - loss_smpl_temporal_pose
       - loss_smpl_temporal_beta
       - loss_smpl_temporal_mesh_translate
+      - loss_smpl_temporal_root_rotation
       - loss_mask
       - mask_soft_iou
       - hungarian_mask_cost
@@ -251,12 +259,11 @@ checkpoint:
   save_dir: logs/${exp_name}/ckpts
   save_freq: 1
   save_step_freq: 5000
-  resume_checkpoint_path: /Multi_SMPL_0706/logs/mamma_mask_dpt_noavgscale_5e-5_continue/ckpts/checkpoint_7.pt
+  resume_checkpoint_path: /Multi_SMPL_Temporal/logs/mamma_harmony4d_concat_mask_dpt_temporal_rel/ckpts/checkpoint_5.pt
   strict: false
   load_aggregator_only: false
   load_model_only: true
-  init_mask_trunk_from_depth: /Multi_SMPL_0706/logs/mamma_mask_dpt_noavgscale_5e-5_continue/ckpts/checkpoint_7.pt
-loss:
+  init_mask_trunk_from_depth: /Multi_SMPL_Temporal/logs/mamma_harmony4d_concat_mask_dpt_temporal_rel/ckpts/checkpoint_5.pt
   _target_: loss.MultitaskLoss
   smplx_model_dir: /dataset/smplx_models
   camera:
@@ -279,11 +286,14 @@ loss:
     weight_temporal_pose: ${temporal_training.weight_pose}
     weight_temporal_beta: ${temporal_training.weight_beta}
     weight_temporal_mesh_translate: ${temporal_training.weight_mesh_translate}
+    weight_temporal_root_rotation: ${temporal_training.weight_root_rotation}
     temporal_pose_order: ${temporal_training.pose_order}
     temporal_beta_order: ${temporal_training.beta_order}
     temporal_mesh_translate_order: ${temporal_training.mesh_translate_order}
     temporal_loss_type: ${temporal_training.loss_type}
     temporal_exclude_root: ${temporal_training.exclude_root}
+    temporal_root_rotation_order: ${temporal_training.root_rotation_order}
+    temporal_root_rotation_loss_type: ${temporal_training.root_rotation_loss_type}
     weight_trans: 0.0
     weight_mesh_translate: 2.0
     weight_presence: 0.5

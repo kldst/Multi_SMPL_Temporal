@@ -203,13 +203,17 @@ def compute_temporal_smpl_smoothness(
     mesh_translate_order: int = 2,
     loss_type: str = "l1",
     exclude_root: bool = True,
+    root_rotation_order: int = 1,
+    root_rotation_loss_type: str = "l1",
 ):
     """Temporal regularizers on Hungarian-matched, identity-ordered people.
 
     Inputs remain framewise ``[B*T,P,...]`` for compatibility with the existing
     loss. ``batch['temporal_shape'] == [B,T]`` is the sole opt-in marker.
     Missing people are removed with products of ``has_smpl`` over every frame in
-    the finite-difference stencil.
+    the finite-difference stencil. Local pose/beta/translation terms are
+    prediction smoothness priors; the root term instead supervises predicted
+    relative SO(3) motion against GT so that intentional turns are not suppressed.
     """
     pred_pose = predictions["smpl_pose"]
     zero = pred_pose.sum() * 0.0
@@ -217,6 +221,7 @@ def compute_temporal_smpl_smoothness(
         "loss_smpl_temporal_pose": zero,
         "loss_smpl_temporal_beta": zero,
         "loss_smpl_temporal_mesh_translate": zero,
+        "loss_smpl_temporal_root_rotation": zero,
     }
     temporal_shape = batch.get("temporal_shape")
     if temporal_shape is None:
@@ -264,6 +269,63 @@ def compute_temporal_smpl_smoothness(
         pose_diff, pose_mask, feature_dims=(-1, -2, -3)
     )
 
+    # Supervise root *motion* rather than forcing the absolute cam0-frame root
+    # orientation to be constant.  Comparing relative SO(3) rotations against
+    # GT preserves genuine turns while penalizing prediction-only angular jumps.
+    gt_pose = batch.get("smpl_pose")
+    if gt_pose is not None:
+        pred_root = pred_pose[:, :P, :3].reshape(B, T, P, 3)
+        gt_root = gt_pose[:, :P, :3].reshape(B, T, P, 3).to(
+            device=pred_root.device, dtype=pred_root.dtype
+        )
+        pred_root_rot = axis_angle_to_rotmat(pred_root).squeeze(-3)
+        gt_root_rot = axis_angle_to_rotmat(gt_root).squeeze(-3)
+        pred_velocity = (
+            pred_root_rot[:, :-1].transpose(-1, -2) @ pred_root_rot[:, 1:]
+        )
+        gt_velocity = (
+            gt_root_rot[:, :-1].transpose(-1, -2) @ gt_root_rot[:, 1:]
+        )
+        root_mask = valid[:, :-1] * valid[:, 1:]
+
+        if int(root_rotation_order) == 1:
+            pred_motion = pred_velocity
+            gt_motion = gt_velocity
+        elif int(root_rotation_order) == 2:
+            if T < 3:
+                pred_motion = gt_motion = None
+            else:
+                pred_motion = (
+                    pred_velocity[:, :-1].transpose(-1, -2)
+                    @ pred_velocity[:, 1:]
+                )
+                gt_motion = (
+                    gt_velocity[:, :-1].transpose(-1, -2)
+                    @ gt_velocity[:, 1:]
+                )
+                root_mask = root_mask[:, :-1] * root_mask[:, 1:]
+        else:
+            raise ValueError(
+                f"Unsupported temporal root rotation order: {root_rotation_order}"
+            )
+
+        if pred_motion is not None:
+            root_angle = rotation_geodesic_angle(pred_motion, gt_motion)
+            if root_rotation_loss_type == "l1":
+                root_value = root_angle
+            elif root_rotation_loss_type == "l2":
+                root_value = root_angle.square()
+            else:
+                raise ValueError(
+                    "Unsupported temporal root rotation loss type: "
+                    f"{root_rotation_loss_type}"
+                )
+            root_mask = root_mask.to(root_value.dtype)
+            result["loss_smpl_temporal_root_rotation"] = (
+                (root_value * root_mask).sum()
+                / root_mask.sum().clamp(min=1.0)
+            )
+
     pred_beta = predictions.get("smpl_beta")
     if pred_beta is not None:
         beta = pred_beta[:, :P].reshape(B, T, P, -1)
@@ -304,11 +366,14 @@ def compute_smpl_loss(
     weight_temporal_pose: float = 0.0,
     weight_temporal_beta: float = 0.0,
     weight_temporal_mesh_translate: float = 0.0,
+    weight_temporal_root_rotation: float = 0.0,
     temporal_pose_order: int = 2,
     temporal_beta_order: int = 1,
     temporal_mesh_translate_order: int = 2,
     temporal_loss_type: str = "l1",
     temporal_exclude_root: bool = True,
+    temporal_root_rotation_order: int = 1,
+    temporal_root_rotation_loss_type: str = "l1",
     use_gt: bool = False,
     # Standalone: use the GT (cam0-normalized) camera ONLY for the joints2d
     # reprojection loss, WITHOUT the full use_gt swap of pose/beta/trans/mesh_translate.
@@ -382,6 +447,7 @@ def compute_smpl_loss(
         "loss_smpl_temporal_pose": predictions["smpl_pose"].sum() * 0.0,
         "loss_smpl_temporal_beta": predictions["smpl_pose"].sum() * 0.0,
         "loss_smpl_temporal_mesh_translate": predictions["smpl_pose"].sum() * 0.0,
+        "loss_smpl_temporal_root_rotation": predictions["smpl_pose"].sum() * 0.0,
     }
     if predictions["smpl_pose"].dim() == 3 and has_people_axis:
         if use_hungarian:
@@ -413,6 +479,8 @@ def compute_smpl_loss(
                 mesh_translate_order=temporal_mesh_translate_order,
                 loss_type=temporal_loss_type,
                 exclude_root=temporal_exclude_root,
+                root_rotation_order=temporal_root_rotation_order,
+                root_rotation_loss_type=temporal_root_rotation_loss_type,
             )
 
         B_people, P_people = predictions["smpl_pose"].shape[:2]
@@ -1178,6 +1246,8 @@ def compute_smpl_loss(
         + weight_temporal_beta * temporal_losses["loss_smpl_temporal_beta"]
         + weight_temporal_mesh_translate
         * temporal_losses["loss_smpl_temporal_mesh_translate"]
+        + weight_temporal_root_rotation
+        * temporal_losses["loss_smpl_temporal_root_rotation"]
     )
 
     return {
